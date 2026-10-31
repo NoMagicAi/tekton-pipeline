@@ -133,6 +133,10 @@ const (
 	SurfacePodEvents = "surface-pod-events"
 	// DefaultSurfacePodEvents is the default value for SurfacePodEvents
 	DefaultSurfacePodEvents = false
+	// EnableSpotRetries is the flag to retry a TaskRun only when its pod lost its spot node
+	EnableSpotRetries = "enable-spot-retries"
+	// DefaultEnableSpotRetries is the default value for EnableSpotRetries
+	DefaultEnableSpotRetries = false
 
 	// EnableStepActions is the flag to enable step actions (no-op since it's stable)
 	EnableStepActions = "enable-step-actions"
@@ -256,6 +260,8 @@ type FeatureFlags struct {
 	EnableTerminationMessageCompression bool   `json:"enableTerminationMessageCompression,omitempty"`
 	KeepStatusSpecDescriptions          bool   `json:"keepStatusSpecDescriptions,omitempty"`
 	EnableSurfacePodEvents              bool   `json:"enableSurfacePodEvents,omitempty"`
+	// EnableSpotRetries stays out of status provenance: the upstream webhook rejects unknown fields there.
+	EnableSpotRetries bool `json:"-"`
 	// DeprecatedEnableTektonOCIBundles is maintained for backward compatibility
 	// to allow deletion of PipelineRuns created before v0.62.x.
 	// This field is not used and can be removed in a future release
@@ -271,6 +277,14 @@ func GetFeatureFlagsConfigName() string {
 		return e
 	}
 	return "feature-flags"
+}
+
+// ForProvenance returns a copy of the flags for status provenance, without the controller-only EnableSpotRetries.
+// The status then equals what the API server stores, so a reconcile does not write it again.
+func (flags *FeatureFlags) ForProvenance() *FeatureFlags {
+	provenanceFlags := flags.DeepCopy()
+	provenanceFlags.EnableSpotRetries = false
+	return provenanceFlags
 }
 
 // NewFeatureFlagsFromMap returns a Config given a map corresponding to a ConfigMap
@@ -376,6 +390,9 @@ func NewFeatureFlagsFromMap(cfgMap map[string]string) (*FeatureFlags, error) {
 		return nil, err
 	}
 	if err := setPerFeatureFlag(SurfacePodEvents, DefaultSurfacePodEventsFlag, &tc.EnableSurfacePodEvents); err != nil {
+		return nil, err
+	}
+	if err := setFeature(EnableSpotRetries, DefaultEnableSpotRetries, &tc.EnableSpotRetries); err != nil {
 		return nil, err
 	}
 
