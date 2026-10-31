@@ -2020,7 +2020,7 @@ func storePipelineSpecAndMergeMeta(ctx context.Context, pr *v1.PipelineRun, ps *
 			pr.Status.Provenance = &v1.Provenance{}
 		}
 		// Store FeatureFlags in the Provenance.
-		pr.Status.Provenance.FeatureFlags = cfg.FeatureFlags
+		pr.Status.Provenance.FeatureFlags = cfg.FeatureFlags.ForProvenance()
 
 		if meta != nil && meta.RefSource != nil && pr.Status.Provenance.RefSource == nil {
 			pr.Status.Provenance.RefSource = meta.RefSource
