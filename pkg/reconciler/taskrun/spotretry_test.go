@@ -95,6 +95,36 @@ func TestNodeLostCause(t *testing.T) {
 	}
 }
 
+func TestPodRejected(t *testing.T) {
+	rejected := &corev1.Pod{Status: corev1.PodStatus{
+		Phase:   corev1.PodFailed,
+		Reason:  "OutOfcpu",
+		Message: "Pod was rejected: Node didn't have enough resource: cpu, requested: 4500, used: 27389, capacity: 31850",
+	}}
+	failedStep := &corev1.Pod{Status: corev1.PodStatus{Phase: corev1.PodFailed, Message: "step failed"}}
+	pendingWithMessage := rejected.DeepCopy()
+	pendingWithMessage.Status.Phase = corev1.PodPending
+
+	tests := []struct {
+		name string
+		pod  *corev1.Pod
+		want bool
+	}{
+		{name: "rejected by the kubelet", pod: rejected, want: true},
+		{name: "failed step", pod: failedStep},
+		{name: "not failed", pod: pendingWithMessage},
+		{name: "nil pod"},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := podRejected(tc.pod); got != tc.want {
+				t.Errorf("podRejected() = %t, want %t", got, tc.want)
+			}
+		})
+	}
+}
+
 func TestFailureCauseVerdict(t *testing.T) {
 	tests := []struct {
 		name         string
@@ -150,6 +180,10 @@ func TestSpotRetryCount(t *testing.T) {
 		name:    "two node losses and one step failure",
 		retries: []v1.TaskRunStatus{attempt(reasonNodeLost), attempt(v1.TaskRunReasonStepFailed), attempt(reasonNodeLost)},
 		want:    2,
+	}, {
+		name:    "pod rejections are not node losses",
+		retries: []v1.TaskRunStatus{attempt(reasonPodRejected), attempt(reasonNodeLost)},
+		want:    1,
 	}, {
 		name:   "the label alone does not count",
 		labels: map[string]string{spotRetriesLabel: "3"},

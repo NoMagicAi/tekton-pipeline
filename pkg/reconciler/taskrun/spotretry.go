@@ -34,6 +34,8 @@ import (
 const (
 	// maxSpotRetries is how many times a TaskRun is retried after its pod lost its node.
 	maxSpotRetries = 3
+	// maxRejectedRetries is how many times a TaskRun is retried after the kubelet rejected its pod.
+	maxRejectedRetries = 3
 
 	spotRetriesLabel       = "ci.nomagic.ai/spot-retries"
 	failureCauseAnnotation = "ci.nomagic.ai/failure-cause"
@@ -41,6 +43,12 @@ const (
 
 	reasonNodeLost               = "NodeLost"
 	reasonWaitingForFailureCause = "WaitingForFailureCause"
+	reasonPodRejected            = "PodRejected"
+	reasonWaitingAfterRejection  = "WaitingAfterPodRejection"
+
+	// rejectedRetryDelay lets the scheduler see the node as the kubelet does before the next pod.
+	// That gap lasted up to 73 s on ci-1, so 3 retries 30 s apart cover it.
+	rejectedRetryDelay = 30 * time.Second
 
 	// failureCauseWait is how long a failed attempt waits for the operator's verdict.
 	failureCauseWait    = 30 * time.Second
@@ -50,12 +58,15 @@ const (
 	podReasonDeletionByPodGC        = "DeletionByPodGC"
 	podReasonDeletionByTaintManager = "DeletionByTaintManager"
 	nodeShutdownMessage             = "Pod was terminated in response to imminent node shutdown."
+	// podRejectedPrefix starts the message of every pod the kubelet rejects at admission.
+	podRejectedPrefix = "Pod was rejected: "
 
 	verdictNodeLost = "node-lost"
 	verdictOther    = "other"
 
-	operatorVerdictCause = "VC node preempted (operator verdict)"
-	eventReasonSpotRetry = "SpotRetry"
+	operatorVerdictCause     = "VC node preempted (operator verdict)"
+	eventReasonSpotRetry     = "SpotRetry"
+	eventReasonRejectedRetry = "PodRejectedRetry"
 )
 
 // retryDecision is what follows a failed attempt when spot retries are on.
@@ -64,8 +75,10 @@ type retryDecision int
 const (
 	retryNone retryDecision = iota
 	retrySpot
+	retryRejected
 	retryUpstream
 	retryHold
+	retryRejectedHold
 )
 
 // nodeLostCause reports whether the pod was disrupted because its node went away.
@@ -90,6 +103,11 @@ func nodeLostCause(pod *corev1.Pod) (cause string, lost bool) {
 	return "", false
 }
 
+// podRejected reports whether the kubelet rejected the pod at admission. No container of such a pod ran.
+func podRejected(pod *corev1.Pod) bool {
+	return pod != nil && pod.Status.Phase == corev1.PodFailed && strings.HasPrefix(pod.Status.Message, podRejectedPrefix)
+}
+
 // failureCauseVerdict reads the operator's verdict ("<pod name>=node-lost" or "=other") for podName.
 // found is false when there is no verdict for that pod.
 func failureCauseVerdict(tr *v1.TaskRun, podName string) (nodeLost bool, found bool) {
@@ -109,9 +127,14 @@ func failureCauseVerdict(tr *v1.TaskRun, podName string) (nodeLost bool, found b
 // spotRetryCount returns the number of spot retries used: earlier attempts with the reason NodeLost.
 // It reads the status, not the label, because syncMetadata writes the label even when the status write fails.
 func spotRetryCount(tr *v1.TaskRun) int {
+	return retriesWithReason(tr, reasonNodeLost)
+}
+
+// retriesWithReason returns the number of earlier attempts that ended with reason.
+func retriesWithReason(tr *v1.TaskRun, reason string) int {
 	count := 0
 	for _, attempt := range tr.Status.RetriesStatus {
-		if attempt.GetCondition(apis.ConditionSucceeded).GetReason() == reasonNodeLost {
+		if attempt.GetCondition(apis.ConditionSucceeded).GetReason() == reason {
 			count++
 		}
 	}
@@ -159,13 +182,23 @@ func attemptFailedAt(tr *v1.TaskRun) (time.Time, bool) {
 }
 
 // decideRetry picks what follows a newly failed attempt. A non-empty cause means the pod lost its node.
+// A pod the kubelet rejected gets a free retry rejectedRetryDelay after the rejection.
 func (c *Reconciler) decideRetry(tr *v1.TaskRun) (decision retryDecision, cause string) {
 	podName := tr.Status.PodName
 	lost := false
+	var pod *corev1.Pod
 	if podName != "" {
-		if pod, err := c.podLister.Pods(tr.Namespace).Get(podName); err == nil {
+		if found, err := c.podLister.Pods(tr.Namespace).Get(podName); err == nil {
+			pod = found
 			cause, lost = nodeLostCause(pod)
 		}
+	}
+	rejectedRetries := retriesWithReason(tr, reasonPodRejected)
+	if podRejected(pod) && rejectedRetries < maxRejectedRetries {
+		if pod.Status.StartTime != nil && c.Clock.Since(pod.Status.StartTime.Time) < rejectedRetryDelay {
+			return retryRejectedHold, ""
+		}
+		return retryRejected, ""
 	}
 	if podName != "" && !lost && needsFailureCauseWait(tr) {
 		nodeLost, found := failureCauseVerdict(tr, podName)
@@ -182,7 +215,7 @@ func (c *Reconciler) decideRetry(tr *v1.TaskRun) (decision retryDecision, cause 
 	if lost && spotRetries < maxSpotRetries {
 		return retrySpot, cause
 	}
-	if len(tr.Status.RetriesStatus)-spotRetries < tr.Spec.Retries {
+	if len(tr.Status.RetriesStatus)-spotRetries-rejectedRetries < tr.Spec.Retries {
 		return retryUpstream, ""
 	}
 	return retryNone, cause
@@ -201,6 +234,21 @@ func retryTaskRunAfterNodeLoss(tr *v1.TaskRun, cause string) {
 		Status:  corev1.ConditionFalse,
 		Reason:  reasonNodeLost,
 		Message: lostMessage,
+	})
+}
+
+// retryTaskRunAfterRejection retries tr for free and marks the rejected attempt with the reason PodRejected.
+func retryTaskRunAfterRejection(tr *v1.TaskRun) {
+	rejectedMessage := tr.Status.GetCondition(apis.ConditionSucceeded).Message
+	rejectedRetries := retriesWithReason(tr, reasonPodRejected) + 1
+
+	retryTaskRun(tr, fmt.Sprintf("Retrying rejected pod (%d of %d): %s", rejectedRetries, maxRejectedRetries, rejectedMessage))
+	rejectedAttempt := &tr.Status.RetriesStatus[len(tr.Status.RetriesStatus)-1]
+	rejectedAttempt.SetCondition(&apis.Condition{
+		Type:    apis.ConditionSucceeded,
+		Status:  corev1.ConditionFalse,
+		Reason:  reasonPodRejected,
+		Message: rejectedMessage,
 	})
 }
 
@@ -226,13 +274,19 @@ func (c *Reconciler) failHoldWithoutPod(ctx context.Context, tr *v1.TaskRun) boo
 	if !config.FromContextOrDefaults(ctx).FeatureFlags.EnableSpotRetries {
 		return false
 	}
-	if tr.Status.GetCondition(apis.ConditionSucceeded).GetReason() != reasonWaitingForFailureCause {
+	var waitingFor string
+	switch tr.Status.GetCondition(apis.ConditionSucceeded).GetReason() {
+	case reasonWaitingForFailureCause:
+		waitingFor = "the failure cause"
+	case reasonWaitingAfterRejection:
+		waitingFor = "the retry"
+	default:
 		return false
 	}
 	if _, err := c.podLister.Pods(tr.Namespace).Get(tr.Status.PodName); !k8serrors.IsNotFound(err) {
 		return false
 	}
-	tr.Status.MarkResourceFailed(v1.TaskRunReasonFailed, fmt.Errorf("pod %s was deleted while waiting for the failure cause", tr.Status.PodName))
+	tr.Status.MarkResourceFailed(v1.TaskRunReasonFailed, fmt.Errorf("pod %s was deleted while waiting for %s", tr.Status.PodName, waitingFor))
 	return true
 }
 
@@ -245,10 +299,18 @@ func (c *Reconciler) retryAfterFailure(ctx context.Context, tr *v1.TaskRun) (hol
 		retryTaskRunAfterNodeLoss(tr, cause)
 		message := tr.Status.GetCondition(apis.ConditionSucceeded).Message
 		controller.GetEventRecorder(ctx).Event(tr, corev1.EventTypeNormal, eventReasonSpotRetry, message)
+	case retryRejected:
+		retryTaskRunAfterRejection(tr)
+		message := tr.Status.GetCondition(apis.ConditionSucceeded).Message
+		controller.GetEventRecorder(ctx).Event(tr, corev1.EventTypeNormal, eventReasonRejectedRetry, message)
 	case retryUpstream:
 		retryTaskRun(tr, failed.Message)
 	case retryHold:
 		tr.Status.MarkResourceOngoing(reasonWaitingForFailureCause, "Waiting for the failure cause of pod "+tr.Status.PodName)
+		tr.Status.CompletionTime = nil
+		return true
+	case retryRejectedHold:
+		tr.Status.MarkResourceOngoing(reasonWaitingAfterRejection, "Waiting to retry rejected pod "+tr.Status.PodName)
 		tr.Status.CompletionTime = nil
 		return true
 	case retryNone:

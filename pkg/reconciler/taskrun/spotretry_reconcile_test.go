@@ -139,6 +139,22 @@ func imagePullSpotPod() *corev1.Pod {
 	return pod
 }
 
+const podRejectedMessage = "Pod was rejected: Node didn't have enough resource: cpu, requested: 4500, used: 27389, capacity: 31850"
+
+// rejectedSpotPod returns the attempt's pod as the kubelet leaves it after it rejected the pod rejectedAgo before the test clock.
+func rejectedSpotPod(rejectedAgo time.Duration) *corev1.Pod {
+	return &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: spotRetryPodName, Namespace: "foo"},
+		Spec:       corev1.PodSpec{NodeName: "node-a"},
+		Status: corev1.PodStatus{
+			Phase:     corev1.PodFailed,
+			Reason:    "OutOfcpu",
+			Message:   podRejectedMessage,
+			StartTime: &metav1.Time{Time: testClock.Now().Add(-rejectedAgo)},
+		},
+	}
+}
+
 func succeeded(status corev1.ConditionStatus, reason, message string) apis.Condition {
 	return apis.Condition{Type: apis.ConditionSucceeded, Status: status, Reason: reason, Message: message}
 }
@@ -156,6 +172,18 @@ func withSpotRetries(tr *v1.TaskRun, n int) {
 	}
 }
 
+// earlierRejection is the condition withRejections puts on each earlier attempt.
+var earlierRejection = succeeded(corev1.ConditionFalse, reasonPodRejected, podRejectedMessage)
+
+// withRejections gives tr n earlier attempts whose pod the kubelet rejected.
+func withRejections(tr *v1.TaskRun, n int) {
+	for range n {
+		rejectedAttempt := v1.TaskRunStatus{}
+		rejectedAttempt.SetCondition(&earlierRejection)
+		tr.Status.RetriesStatus = append(tr.Status.RetriesStatus, rejectedAttempt)
+	}
+}
+
 func repeatCondition(condition apis.Condition, n int) []apis.Condition {
 	conditions := make([]apis.Condition, n)
 	for i := range conditions {
@@ -164,13 +192,13 @@ func repeatCondition(condition apis.Condition, n int) []apis.Condition {
 	return conditions
 }
 
-// spotRetryEvents drains the recorder and returns only the SpotRetry events.
+// spotRetryEvents drains the recorder and returns only the SpotRetry and PodRejectedRetry events.
 func spotRetryEvents(events chan string) []string {
 	var spotEvents []string
 	for {
 		select {
 		case event := <-events:
-			if strings.HasPrefix(event, "Normal SpotRetry ") {
+			if strings.HasPrefix(event, "Normal SpotRetry ") || strings.HasPrefix(event, "Normal PodRejectedRetry ") {
 				spotEvents = append(spotEvents, event)
 			}
 		default:
@@ -284,6 +312,66 @@ func TestReconcileSpotRetry(t *testing.T) {
 			succeeded(corev1.ConditionFalse, v1.TaskRunReasonStepFailed.String(), stepFailed1),
 		},
 		wantLabel: "1",
+	}, {
+		name:     "rejected pod waits before the retry",
+		pod:      rejectedSpotPod(5 * time.Second),
+		want:     succeeded(corev1.ConditionUnknown, reasonWaitingAfterRejection, "Waiting to retry rejected pod "+spotRetryPodName),
+		wantHold: true,
+	}, {
+		name:        "rejected pod, retries 0",
+		pod:         rejectedSpotPod(rejectedRetryDelay),
+		want:        succeeded(corev1.ConditionUnknown, v1.TaskRunReasonToBeRetried.String(), "Retrying rejected pod (1 of 3): "+podRejectedMessage),
+		wantRetries: []apis.Condition{earlierRejection},
+		wantEvent:   "Normal PodRejectedRetry Retrying rejected pod (1 of 3): " + podRejectedMessage,
+	}, {
+		name: "rejected pod after the hold",
+		setup: func(tr *v1.TaskRun) {
+			tr.Status.MarkResourceOngoing(reasonWaitingAfterRejection, "Waiting to retry rejected pod "+spotRetryPodName)
+		},
+		pod:         rejectedSpotPod(rejectedRetryDelay),
+		want:        succeeded(corev1.ConditionUnknown, v1.TaskRunReasonToBeRetried.String(), "Retrying rejected pod (1 of 3): "+podRejectedMessage),
+		wantRetries: []apis.Condition{earlierRejection},
+		wantEvent:   "Normal PodRejectedRetry Retrying rejected pod (1 of 3): " + podRejectedMessage,
+	}, {
+		name: "rejected pod without a start time retries now",
+		pod: func() *corev1.Pod {
+			pod := rejectedSpotPod(0)
+			pod.Status.StartTime = nil
+			return pod
+		}(),
+		want:        succeeded(corev1.ConditionUnknown, v1.TaskRunReasonToBeRetried.String(), "Retrying rejected pod (1 of 3): "+podRejectedMessage),
+		wantRetries: []apis.Condition{earlierRejection},
+		wantEvent:   "Normal PodRejectedRetry Retrying rejected pod (1 of 3): " + podRejectedMessage,
+	}, {
+		name:        "rejected fixture pod does not wait for a verdict",
+		setup:       func(tr *v1.TaskRun) { tr.Annotations = fixtureAnnotations() },
+		pod:         rejectedSpotPod(rejectedRetryDelay),
+		want:        succeeded(corev1.ConditionUnknown, v1.TaskRunReasonToBeRetried.String(), "Retrying rejected pod (1 of 3): "+podRejectedMessage),
+		wantRetries: []apis.Condition{earlierRejection},
+		wantEvent:   "Normal PodRejectedRetry Retrying rejected pod (1 of 3): " + podRejectedMessage,
+	}, {
+		name: "rejections do not use retries",
+		setup: func(tr *v1.TaskRun) {
+			withRejections(tr, 1)
+			tr.Spec.Retries = 1
+		},
+		pod:  failedSpotPod(1, 5*time.Second),
+		want: succeeded(corev1.ConditionUnknown, v1.TaskRunReasonToBeRetried.String(), stepFailed1),
+		wantRetries: []apis.Condition{
+			earlierRejection,
+			succeeded(corev1.ConditionFalse, v1.TaskRunReasonStepFailed.String(), stepFailed1),
+		},
+	}, {
+		name:        "rejection limit reached",
+		setup:       func(tr *v1.TaskRun) { withRejections(tr, 3) },
+		pod:         rejectedSpotPod(rejectedRetryDelay),
+		want:        succeeded(corev1.ConditionFalse, v1.TaskRunReasonFailed.String(), podRejectedMessage),
+		wantRetries: repeatCondition(earlierRejection, 3),
+	}, {
+		name: "rejected pod, flag off",
+		flag: "false",
+		pod:  rejectedSpotPod(rejectedRetryDelay),
+		want: succeeded(corev1.ConditionFalse, v1.TaskRunReasonFailed.String(), podRejectedMessage),
 	}, {
 		name:     "hold",
 		setup:    func(tr *v1.TaskRun) { tr.Annotations = fixtureAnnotations() },
@@ -633,6 +721,26 @@ func TestReconcileSpotRetryPodDeletedDuringHold(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestReconcileRejectedPodDeletedDuringHold checks that a rejected pod deleted while it waits for its retry is not created again.
+func TestReconcileRejectedPodDeletedDuringHold(t *testing.T) {
+	tr := spotRetryTaskRun(t)
+	tr.Status.MarkResourceOngoing(reasonWaitingAfterRejection, "Waiting to retry rejected pod "+spotRetryPodName)
+	assets, cancel := getTaskRunController(t, spotRetryTestData(tr, nil, "true"))
+	defer cancel()
+	createServiceAccount(t, assets, "default", tr.Namespace)
+
+	got, gotHold := reconcileSpotRetry(t, assets, tr, false)
+
+	if created := createdPods(assets); len(created) > 0 {
+		t.Errorf("created pods %v, want none", created)
+	}
+	if gotHold {
+		t.Error("hold = true, want false")
+	}
+	want := succeeded(corev1.ConditionFalse, v1.TaskRunReasonFailed.String(), "pod "+spotRetryPodName+" was deleted while waiting for the retry")
+	checkSpotRetryResult(t, got, want, nil, "")
 }
 
 // TestReconcileSpotRetryStatusWriteFails checks that a rejected status write does not use a spot retry,
