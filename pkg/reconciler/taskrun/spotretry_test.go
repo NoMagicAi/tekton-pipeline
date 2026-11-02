@@ -161,7 +161,7 @@ func TestFailureCauseVerdict(t *testing.T) {
 	}
 }
 
-func TestSpotRetryCount(t *testing.T) {
+func TestNodeLostRetryCount(t *testing.T) {
 	attempt := func(reason v1.TaskRunReason) v1.TaskRunStatus {
 		status := v1.TaskRunStatus{}
 		status.MarkResourceFailed(reason, errors.New("failed"))
@@ -186,7 +186,7 @@ func TestSpotRetryCount(t *testing.T) {
 		want:    1,
 	}, {
 		name:   "the label alone does not count",
-		labels: map[string]string{spotRetriesLabel: "3"},
+		labels: map[string]string{nodeLostRetriesLabel: "3"},
 		want:   0,
 	}}
 
@@ -196,8 +196,36 @@ func TestSpotRetryCount(t *testing.T) {
 				ObjectMeta: metav1.ObjectMeta{Labels: tc.labels},
 				Status:     v1.TaskRunStatus{TaskRunStatusFields: v1.TaskRunStatusFields{RetriesStatus: tc.retries}},
 			}
-			if got := spotRetryCount(tr); got != tc.want {
-				t.Errorf("spotRetryCount() = %d, want %d", got, tc.want)
+			if got := nodeLostRetryCount(tr); got != tc.want {
+				t.Errorf("nodeLostRetryCount() = %d, want %d", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestOperatorVerdictCause(t *testing.T) {
+	tests := []struct {
+		name        string
+		annotations map[string]string
+		want        string
+	}{{
+		name:        "cause from the operator",
+		annotations: map[string]string{"ci.nomagic.ai/failure-cause-detail": "VC node gke-d5649e-l2vr preempted"},
+		want:        "VC node gke-d5649e-l2vr preempted (operator verdict)",
+	}, {
+		name: "no cause: an operator before 0.16.0",
+		want: "VC node lost (operator verdict)",
+	}, {
+		name:        "empty cause",
+		annotations: map[string]string{"ci.nomagic.ai/failure-cause-detail": ""},
+		want:        "VC node lost (operator verdict)",
+	}}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			tr := &v1.TaskRun{ObjectMeta: metav1.ObjectMeta{Annotations: tc.annotations}}
+			if got := operatorVerdictCause(tr); got != tc.want {
+				t.Errorf("operatorVerdictCause() = %q, want %q", got, tc.want)
 			}
 		})
 	}

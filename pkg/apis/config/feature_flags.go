@@ -133,7 +133,7 @@ const (
 	SurfacePodEvents = "surface-pod-events"
 	// DefaultSurfacePodEvents is the default value for SurfacePodEvents
 	DefaultSurfacePodEvents = false
-	// EnableSpotRetries is the flag to retry a TaskRun for free when its pod lost its spot node or the kubelet rejected it
+	// EnableSpotRetries is the flag to retry a TaskRun for free when its pod lost its node or the kubelet rejected it
 	EnableSpotRetries = "enable-spot-retries"
 	// DefaultEnableSpotRetries is the default value for EnableSpotRetries
 	DefaultEnableSpotRetries = false

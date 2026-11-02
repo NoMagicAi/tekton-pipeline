@@ -168,6 +168,6 @@ data:
   # status.taskSpec/status.pipelineSpec snapshots by default to reduce etcd usage.
   # Set this flag to "true" to keep those descriptions during a migration window.
   keep-status-spec-descriptions: "false"
-  # Setting this flag to "true" gives a TaskRun free retries when its pod lost its spot node
-  # or the kubelet rejected it.
+  # Setting this flag to "true" gives a TaskRun free retries when its pod lost its node
+  # (spot preemption or a node that went down) or the kubelet rejected it.
   enable-spot-retries: "false"

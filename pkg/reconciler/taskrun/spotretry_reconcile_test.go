@@ -159,12 +159,12 @@ func succeeded(status corev1.ConditionStatus, reason, message string) apis.Condi
 	return apis.Condition{Type: apis.ConditionSucceeded, Status: status, Reason: reason, Message: message}
 }
 
-// earlierNodeLoss is the condition withSpotRetries puts on each earlier attempt.
+// earlierNodeLoss is the condition withNodeLostRetries puts on each earlier attempt.
 var earlierNodeLoss = succeeded(corev1.ConditionFalse, reasonNodeLost, "pod lost to node shutdown on node-b")
 
-// withSpotRetries gives tr n earlier attempts lost to a node and the matching label.
-func withSpotRetries(tr *v1.TaskRun, n int) {
-	tr.Labels = map[string]string{spotRetriesLabel: strconv.Itoa(n)}
+// withNodeLostRetries gives tr n earlier attempts lost to a node and the matching label.
+func withNodeLostRetries(tr *v1.TaskRun, n int) {
+	tr.Labels = map[string]string{nodeLostRetriesLabel: strconv.Itoa(n)}
 	for range n {
 		lostAttempt := v1.TaskRunStatus{}
 		lostAttempt.SetCondition(&earlierNodeLoss)
@@ -192,17 +192,17 @@ func repeatCondition(condition apis.Condition, n int) []apis.Condition {
 	return conditions
 }
 
-// spotRetryEvents drains the recorder and returns only the SpotRetry and PodRejectedRetry events.
-func spotRetryEvents(events chan string) []string {
-	var spotEvents []string
+// retryEvents drains the recorder and returns only the NodeLostRetry and PodRejectedRetry events.
+func retryEvents(events chan string) []string {
+	var freeRetryEvents []string
 	for {
 		select {
 		case event := <-events:
-			if strings.HasPrefix(event, "Normal SpotRetry ") || strings.HasPrefix(event, "Normal PodRejectedRetry ") {
-				spotEvents = append(spotEvents, event)
+			if strings.HasPrefix(event, "Normal NodeLostRetry ") || strings.HasPrefix(event, "Normal PodRejectedRetry ") {
+				freeRetryEvents = append(freeRetryEvents, event)
 			}
 		default:
-			return spotEvents
+			return freeRetryEvents
 		}
 	}
 }
@@ -249,8 +249,8 @@ func checkSpotRetryResult(t *testing.T, got *v1.TaskRun, want apis.Condition, wa
 	if d := cmp.Diff(wantRetries, gotRetries, ignoreLastTransitionTime, cmpopts.EquateEmpty()); d != "" {
 		t.Errorf("retriesStatus conditions %s", diff.PrintWantGot(d))
 	}
-	if gotLabel := got.Labels[spotRetriesLabel]; gotLabel != wantLabel {
-		t.Errorf("label %s = %q, want %q", spotRetriesLabel, gotLabel, wantLabel)
+	if gotLabel := got.Labels["ci.nomagic.ai/node-lost-retries"]; gotLabel != wantLabel {
+		t.Errorf("label ci.nomagic.ai/node-lost-retries = %q, want %q", gotLabel, wantLabel)
 	}
 }
 
@@ -263,7 +263,7 @@ func TestReconcileSpotRetry(t *testing.T) {
 		want               apis.Condition
 		wantRetries        []apis.Condition // the Succeeded condition of each retriesStatus entry
 		wantLabel          string
-		wantEvent          string // the SpotRetry event, if any
+		wantEvent          string // the NodeLostRetry event, if any
 		wantHold           bool
 		wantReconcileError bool
 		stopSidecarsFails  bool // reading the pod fails, so stopSidecars marks the TaskRun failed
@@ -275,9 +275,9 @@ func TestReconcileSpotRetry(t *testing.T) {
 			succeeded(corev1.ConditionFalse, reasonNodeLost, nodeShutdownCause+" (was StepFailed: "+stepFailed255+")"),
 		},
 		wantLabel: "1",
-		wantEvent: "Normal SpotRetry Retrying after node loss (1 of 3): " + nodeShutdownCause,
+		wantEvent: "Normal NodeLostRetry Retrying after node loss (1 of 3): " + nodeShutdownCause,
 	}, {
-		name: "eviction is not a spot retry",
+		name: "eviction is not a node-loss retry",
 		pod:  evictedSpotPod(),
 		want: succeeded(corev1.ConditionFalse, v1.TaskRunReasonPodEvicted.String(), "The node was low on resource: memory."),
 	}, {
@@ -294,15 +294,15 @@ func TestReconcileSpotRetry(t *testing.T) {
 		},
 	}, {
 		name:        "limit reached",
-		setup:       func(tr *v1.TaskRun) { withSpotRetries(tr, 3) },
+		setup:       func(tr *v1.TaskRun) { withNodeLostRetries(tr, 3) },
 		pod:         failedSpotPod(255, 5*time.Second, nodeShutdownCondition),
-		want:        succeeded(corev1.ConditionFalse, reasonNodeLost, nodeShutdownCause+"; spot retry limit 3 reached (was StepFailed: "+stepFailed255+")"),
+		want:        succeeded(corev1.ConditionFalse, reasonNodeLost, nodeShutdownCause+"; node loss retry limit 3 reached (was StepFailed: "+stepFailed255+")"),
 		wantRetries: repeatCondition(earlierNodeLoss, 3),
 		wantLabel:   "3",
 	}, {
-		name: "spot retries do not use retries",
+		name: "node-loss retries do not use retries",
 		setup: func(tr *v1.TaskRun) {
-			withSpotRetries(tr, 1)
+			withNodeLostRetries(tr, 1)
 			tr.Spec.Retries = 1
 		},
 		pod:  failedSpotPod(1, 5*time.Second),
@@ -384,12 +384,28 @@ func TestReconcileSpotRetry(t *testing.T) {
 			tr.Annotations = map[string]string{fixtureAnnotation: "abb-studio-1", failureCauseAnnotation: spotRetryPodName + "=node-lost"}
 		},
 		pod:  failedSpotPod(1, 5*time.Second),
-		want: succeeded(corev1.ConditionUnknown, v1.TaskRunReasonToBeRetried.String(), "Retrying after node loss (1 of 3): VC node preempted (operator verdict)"),
+		want: succeeded(corev1.ConditionUnknown, v1.TaskRunReasonToBeRetried.String(), "Retrying after node loss (1 of 3): VC node lost (operator verdict)"),
 		wantRetries: []apis.Condition{
-			succeeded(corev1.ConditionFalse, reasonNodeLost, "VC node preempted (operator verdict) (was StepFailed: "+stepFailed1+")"),
+			succeeded(corev1.ConditionFalse, reasonNodeLost, "VC node lost (operator verdict) (was StepFailed: "+stepFailed1+")"),
 		},
 		wantLabel: "1",
-		wantEvent: "Normal SpotRetry Retrying after node loss (1 of 3): VC node preempted (operator verdict)",
+		wantEvent: "Normal NodeLostRetry Retrying after node loss (1 of 3): VC node lost (operator verdict)",
+	}, {
+		name: "verdict node-lost with the operator's cause",
+		setup: func(tr *v1.TaskRun) {
+			tr.Annotations = map[string]string{
+				fixtureAnnotation:                    "abb-studio-1",
+				failureCauseAnnotation:               spotRetryPodName + "=node-lost",
+				"ci.nomagic.ai/failure-cause-detail": "VC pod evicted by taint manager on gke-853a87-f442",
+			}
+		},
+		pod:  failedSpotPod(1, 5*time.Second),
+		want: succeeded(corev1.ConditionUnknown, v1.TaskRunReasonToBeRetried.String(), "Retrying after node loss (1 of 3): VC pod evicted by taint manager on gke-853a87-f442 (operator verdict)"),
+		wantRetries: []apis.Condition{
+			succeeded(corev1.ConditionFalse, reasonNodeLost, "VC pod evicted by taint manager on gke-853a87-f442 (operator verdict) (was StepFailed: "+stepFailed1+")"),
+		},
+		wantLabel: "1",
+		wantEvent: "Normal NodeLostRetry Retrying after node loss (1 of 3): VC pod evicted by taint manager on gke-853a87-f442 (operator verdict)",
 	}, {
 		name: "stale verdict after window",
 		setup: func(tr *v1.TaskRun) {
@@ -420,7 +436,7 @@ func TestReconcileSpotRetry(t *testing.T) {
 		want: succeeded(corev1.ConditionFalse, v1.TaskRunReasonCancelled.String(),
 			`TaskRun "test-spot-retry" was cancelled. `+"\nPrevious status: [WaitingForFailureCause] Waiting for the failure cause of pod "+spotRetryPodName),
 	}, {
-		name: "timeout is not a spot retry",
+		name: "timeout is not a node-loss retry",
 		setup: func(tr *v1.TaskRun) {
 			tr.Spec.Timeout = &metav1.Duration{Duration: 10 * time.Second}
 		},
@@ -492,15 +508,15 @@ func TestReconcileSpotRetry(t *testing.T) {
 	}, {
 		name: "final NodeLost is not rewritten",
 		setup: func(tr *v1.TaskRun) {
-			withSpotRetries(tr, 3)
-			tr.Status.MarkResourceFailed(reasonNodeLost, errors.New(nodeShutdownCause+"; spot retry limit 3 reached (was StepFailed: "+stepFailed255+")"))
+			withNodeLostRetries(tr, 3)
+			tr.Status.MarkResourceFailed(reasonNodeLost, errors.New(nodeShutdownCause+"; node loss retry limit 3 reached (was StepFailed: "+stepFailed255+")"))
 		},
 		pod:         failedSpotPod(255, 5*time.Second, nodeShutdownCondition),
-		want:        succeeded(corev1.ConditionFalse, reasonNodeLost, nodeShutdownCause+"; spot retry limit 3 reached (was StepFailed: "+stepFailed255+")"),
+		want:        succeeded(corev1.ConditionFalse, reasonNodeLost, nodeShutdownCause+"; node loss retry limit 3 reached (was StepFailed: "+stepFailed255+")"),
 		wantRetries: repeatCondition(earlierNodeLoss, 3),
 		wantLabel:   "3",
 	}, {
-		name: "succeeded TaskRun is not spot-retried",
+		name: "succeeded TaskRun gets no node-loss retry",
 		setup: func(tr *v1.TaskRun) {
 			tr.Status.SetCondition(&apis.Condition{
 				Type:    apis.ConditionSucceeded,
@@ -516,8 +532,8 @@ func TestReconcileSpotRetry(t *testing.T) {
 	}, {
 		name: "lost label is repaired",
 		setup: func(tr *v1.TaskRun) {
-			withSpotRetries(tr, 1)
-			tr.Labels = nil // the label write failed when the spot retry happened
+			withNodeLostRetries(tr, 1)
+			tr.Labels = nil // the label write failed when the node-loss retry happened
 		},
 		pod:         runningSpotPod(),
 		want:        succeeded(corev1.ConditionUnknown, v1.TaskRunReasonRunning.String(), "Not all Steps in the Task have finished executing"),
@@ -560,8 +576,8 @@ func TestReconcileSpotRetry(t *testing.T) {
 			if tc.wantEvent != "" {
 				wantEvents = []string{tc.wantEvent}
 			}
-			if d := cmp.Diff(wantEvents, spotRetryEvents(assets.Recorder.Events), cmpopts.EquateEmpty()); d != "" {
-				t.Errorf("SpotRetry events %s", diff.PrintWantGot(d))
+			if d := cmp.Diff(wantEvents, retryEvents(assets.Recorder.Events), cmpopts.EquateEmpty()); d != "" {
+				t.Errorf("retry events %s", diff.PrintWantGot(d))
 			}
 		})
 	}
@@ -579,9 +595,9 @@ func TestReconcileSpotRetryAfterHold(t *testing.T) {
 	}{{
 		name:    "verdict arrives",
 		verdict: spotRetryPodName + "=node-lost",
-		want:    succeeded(corev1.ConditionUnknown, v1.TaskRunReasonToBeRetried.String(), "Retrying after node loss (1 of 3): VC node preempted (operator verdict)"),
+		want:    succeeded(corev1.ConditionUnknown, v1.TaskRunReasonToBeRetried.String(), "Retrying after node loss (1 of 3): VC node lost (operator verdict)"),
 		wantRetries: []apis.Condition{
-			succeeded(corev1.ConditionFalse, reasonNodeLost, "VC node preempted (operator verdict) (was StepFailed: "+stepFailed1+")"),
+			succeeded(corev1.ConditionFalse, reasonNodeLost, "VC node lost (operator verdict) (was StepFailed: "+stepFailed1+")"),
 		},
 		wantLabel: "1",
 	}, {
@@ -681,9 +697,9 @@ func TestReconcileSpotRetryPodDeletedDuringHold(t *testing.T) {
 		name:        "window over, verdict node-lost",
 		finishedAgo: 60 * time.Second,
 		verdict:     spotRetryPodName + "=node-lost",
-		want:        succeeded(corev1.ConditionUnknown, v1.TaskRunReasonToBeRetried.String(), "Retrying after node loss (1 of 3): VC node preempted (operator verdict)"),
+		want:        succeeded(corev1.ConditionUnknown, v1.TaskRunReasonToBeRetried.String(), "Retrying after node loss (1 of 3): VC node lost (operator verdict)"),
 		wantRetries: []apis.Condition{
-			succeeded(corev1.ConditionFalse, reasonNodeLost, "VC node preempted (operator verdict) (was Failed: "+deletedMessage+")"),
+			succeeded(corev1.ConditionFalse, reasonNodeLost, "VC node lost (operator verdict) (was Failed: "+deletedMessage+")"),
 		},
 		wantLabel:   "1",
 		wantNextPod: "test-spot-retry-pod-retry1",
@@ -743,7 +759,7 @@ func TestReconcileRejectedPodDeletedDuringHold(t *testing.T) {
 	checkSpotRetryResult(t, got, want, nil, "")
 }
 
-// TestReconcileSpotRetryStatusWriteFails checks that a rejected status write does not use a spot retry,
+// TestReconcileSpotRetryStatusWriteFails checks that a rejected status write does not use a node-loss retry,
 // although the label write in syncMetadata succeeds.
 func TestReconcileSpotRetryStatusWriteFails(t *testing.T) {
 	tr := spotRetryTaskRun(t)
@@ -768,11 +784,11 @@ func TestReconcileSpotRetryStatusWriteFails(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if gotLabel := stored.Labels[spotRetriesLabel]; gotLabel != "1" {
-		t.Errorf("label %s = %q, want \"1\"", spotRetriesLabel, gotLabel)
+	if gotLabel := stored.Labels["ci.nomagic.ai/node-lost-retries"]; gotLabel != "1" {
+		t.Errorf("label ci.nomagic.ai/node-lost-retries = %q, want \"1\"", gotLabel)
 	}
-	wantEvent := "Normal SpotRetry Retrying after node loss (1 of 3): " + nodeShutdownCause
-	if d := cmp.Diff([]string{wantEvent, wantEvent}, spotRetryEvents(assets.Recorder.Events)); d != "" {
-		t.Errorf("SpotRetry events %s", diff.PrintWantGot(d))
+	wantEvent := "Normal NodeLostRetry Retrying after node loss (1 of 3): " + nodeShutdownCause
+	if d := cmp.Diff([]string{wantEvent, wantEvent}, retryEvents(assets.Recorder.Events)); d != "" {
+		t.Errorf("retry events %s", diff.PrintWantGot(d))
 	}
 }

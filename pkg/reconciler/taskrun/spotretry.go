@@ -32,14 +32,16 @@ import (
 )
 
 const (
-	// maxSpotRetries is how many times a TaskRun is retried after its pod lost its node.
-	maxSpotRetries = 3
+	// maxNodeLostRetries is how many times a TaskRun is retried after its pod lost its node.
+	maxNodeLostRetries = 3
 	// maxRejectedRetries is how many times a TaskRun is retried after the kubelet rejected its pod.
 	maxRejectedRetries = 3
 
-	spotRetriesLabel       = "ci.nomagic.ai/spot-retries"
+	nodeLostRetriesLabel   = "ci.nomagic.ai/node-lost-retries"
 	failureCauseAnnotation = "ci.nomagic.ai/failure-cause"
-	fixtureAnnotation      = "nomagic.ai/fixture"
+	// failureCauseDetailAnnotation is the operator's text for the verdict, written with it.
+	failureCauseDetailAnnotation = "ci.nomagic.ai/failure-cause-detail"
+	fixtureAnnotation            = "nomagic.ai/fixture"
 
 	reasonNodeLost               = "NodeLost"
 	reasonWaitingForFailureCause = "WaitingForFailureCause"
@@ -64,17 +66,16 @@ const (
 	verdictNodeLost = "node-lost"
 	verdictOther    = "other"
 
-	operatorVerdictCause     = "VC node preempted (operator verdict)"
-	eventReasonSpotRetry     = "SpotRetry"
+	eventReasonNodeLostRetry = "NodeLostRetry"
 	eventReasonRejectedRetry = "PodRejectedRetry"
 )
 
-// retryDecision is what follows a failed attempt when spot retries are on.
+// retryDecision is what follows a failed attempt when enable-spot-retries is on.
 type retryDecision int
 
 const (
 	retryNone retryDecision = iota
-	retrySpot
+	retryNodeLost
 	retryRejected
 	retryUpstream
 	retryHold
@@ -103,6 +104,14 @@ func nodeLostCause(pod *corev1.Pod) (cause string, lost bool) {
 	return "", false
 }
 
+// operatorVerdictCause is the cause of a node loss that abb-studio-operator found: its own text, if it wrote one.
+func operatorVerdictCause(tr *v1.TaskRun) string {
+	if detail := tr.Annotations[failureCauseDetailAnnotation]; detail != "" {
+		return detail + " (operator verdict)"
+	}
+	return "VC node lost (operator verdict)"
+}
+
 // podRejected reports whether the kubelet rejected the pod at admission. No container of such a pod ran.
 func podRejected(pod *corev1.Pod) bool {
 	return pod != nil && pod.Status.Phase == corev1.PodFailed && strings.HasPrefix(pod.Status.Message, podRejectedPrefix)
@@ -124,9 +133,9 @@ func failureCauseVerdict(tr *v1.TaskRun, podName string) (nodeLost bool, found b
 	return false, false
 }
 
-// spotRetryCount returns the number of spot retries used: earlier attempts with the reason NodeLost.
+// nodeLostRetryCount returns the number of node-loss retries used: earlier attempts with the reason NodeLost.
 // It reads the status, not the label, because syncMetadata writes the label even when the status write fails.
-func spotRetryCount(tr *v1.TaskRun) int {
+func nodeLostRetryCount(tr *v1.TaskRun) int {
 	return retriesWithReason(tr, reasonNodeLost)
 }
 
@@ -205,29 +214,29 @@ func (c *Reconciler) decideRetry(tr *v1.TaskRun) (decision retryDecision, cause 
 		failedAt, failed := attemptFailedAt(tr)
 		switch {
 		case nodeLost:
-			cause, lost = operatorVerdictCause, true
+			cause, lost = operatorVerdictCause(tr), true
 		case !found && failed && c.Clock.Since(failedAt) < failureCauseWait:
 			return retryHold, ""
 		}
 	}
 
-	spotRetries := spotRetryCount(tr)
-	if lost && spotRetries < maxSpotRetries {
-		return retrySpot, cause
+	nodeLostRetries := nodeLostRetryCount(tr)
+	if lost && nodeLostRetries < maxNodeLostRetries {
+		return retryNodeLost, cause
 	}
-	if len(tr.Status.RetriesStatus)-spotRetries-rejectedRetries < tr.Spec.Retries {
+	if len(tr.Status.RetriesStatus)-nodeLostRetries-rejectedRetries < tr.Spec.Retries {
 		return retryUpstream, ""
 	}
 	return retryNone, cause
 }
 
-// retryTaskRunAfterNodeLoss retries tr as a spot retry and marks the lost attempt with the reason NodeLost.
+// retryTaskRunAfterNodeLoss retries tr as a node-loss retry and marks the lost attempt with the reason NodeLost.
 func retryTaskRunAfterNodeLoss(tr *v1.TaskRun, cause string) {
 	failed := tr.Status.GetCondition(apis.ConditionSucceeded)
 	lostMessage := fmt.Sprintf("%s (was %s: %s)", cause, failed.Reason, failed.Message)
-	spotRetries := spotRetryCount(tr) + 1
+	nodeLostRetries := nodeLostRetryCount(tr) + 1
 
-	retryTaskRun(tr, fmt.Sprintf("Retrying after node loss (%d of %d): %s", spotRetries, maxSpotRetries, cause))
+	retryTaskRun(tr, fmt.Sprintf("Retrying after node loss (%d of %d): %s", nodeLostRetries, maxNodeLostRetries, cause))
 	lostAttempt := &tr.Status.RetriesStatus[len(tr.Status.RetriesStatus)-1]
 	lostAttempt.SetCondition(&apis.Condition{
 		Type:    apis.ConditionSucceeded,
@@ -252,20 +261,20 @@ func retryTaskRunAfterRejection(tr *v1.TaskRun) {
 	})
 }
 
-// setSpotRetriesLabel mirrors the spot retry count into the label. It runs on every reconcile,
-// so it also repairs a label write that failed at the spot retry.
-func setSpotRetriesLabel(ctx context.Context, tr *v1.TaskRun) {
+// setNodeLostRetriesLabel mirrors the node-loss retry count into the label. It runs on every reconcile,
+// so it also repairs a label write that failed at the node-loss retry.
+func setNodeLostRetriesLabel(ctx context.Context, tr *v1.TaskRun) {
 	if !config.FromContextOrDefaults(ctx).FeatureFlags.EnableSpotRetries {
 		return
 	}
-	spotRetries := spotRetryCount(tr)
-	if spotRetries == 0 {
+	nodeLostRetries := nodeLostRetryCount(tr)
+	if nodeLostRetries == 0 {
 		return
 	}
 	if tr.Labels == nil {
 		tr.Labels = map[string]string{}
 	}
-	tr.Labels[spotRetriesLabel] = strconv.Itoa(spotRetries)
+	tr.Labels[nodeLostRetriesLabel] = strconv.Itoa(nodeLostRetries)
 }
 
 // failHoldWithoutPod fails a held attempt whose pod is gone, so reconcile does not create the pod again
@@ -295,10 +304,10 @@ func (c *Reconciler) retryAfterFailure(ctx context.Context, tr *v1.TaskRun) (hol
 	decision, cause := c.decideRetry(tr)
 	failed := tr.Status.GetCondition(apis.ConditionSucceeded)
 	switch decision {
-	case retrySpot:
+	case retryNodeLost:
 		retryTaskRunAfterNodeLoss(tr, cause)
 		message := tr.Status.GetCondition(apis.ConditionSucceeded).Message
-		controller.GetEventRecorder(ctx).Event(tr, corev1.EventTypeNormal, eventReasonSpotRetry, message)
+		controller.GetEventRecorder(ctx).Event(tr, corev1.EventTypeNormal, eventReasonNodeLostRetry, message)
 	case retryRejected:
 		retryTaskRunAfterRejection(tr)
 		message := tr.Status.GetCondition(apis.ConditionSucceeded).Message
@@ -319,7 +328,7 @@ func (c *Reconciler) retryAfterFailure(ctx context.Context, tr *v1.TaskRun) (hol
 				Type:    apis.ConditionSucceeded,
 				Status:  corev1.ConditionFalse,
 				Reason:  reasonNodeLost,
-				Message: fmt.Sprintf("%s; spot retry limit %d reached (was %s: %s)", cause, maxSpotRetries, failed.Reason, failed.Message),
+				Message: fmt.Sprintf("%s; node loss retry limit %d reached (was %s: %s)", cause, maxNodeLostRetries, failed.Reason, failed.Message),
 			})
 		}
 	}

@@ -368,7 +368,7 @@ func (c *Reconciler) ReconcileKind(ctx context.Context, tr *v1.TaskRun) (reconci
 	// Knative's generated reconciler only calls UpdateStatus(), never writes .metadata,
 	// so we must persist label/annotation changes ourselves.
 	defer func() {
-		setSpotRetriesLabel(ctx, tr)
+		setNodeLostRetriesLabel(ctx, tr)
 		if err := c.syncMetadata(ctx, tr); err != nil {
 			logger.Warn("Failed to sync TaskRun metadata", zap.Error(err))
 			events.EmitError(controller.GetEventRecorder(ctx), err, tr)
@@ -737,7 +737,7 @@ func (c *Reconciler) emitReconcileEvents(ctx context.Context, tr *v1.TaskRun, be
 	defer span.End()
 
 	afterCondition := tr.Status.GetCondition(apis.ConditionSucceeded)
-	// Spot retries decide only an attempt that was running before this reconcile (IsUnknown is true for nil),
+	// Free retries (enable-spot-retries) decide only an attempt that was running before this reconcile (IsUnknown is true for nil),
 	// never a done TaskRun: not a resync, not a succeeded one that stopSidecars marks failed.
 	spotRetriesDecide := config.FromContextOrDefaults(ctx).FeatureFlags.EnableSpotRetries && beforeCondition.IsUnknown()
 	hold := false
