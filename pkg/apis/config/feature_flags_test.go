@@ -17,6 +17,7 @@ limitations under the License.
 package config_test
 
 import (
+	"encoding/json"
 	"testing"
 
 	"github.com/google/go-cmp/cmp"
@@ -83,6 +84,7 @@ func TestNewFeatureFlagsFromConfigMap(t *testing.T) {
 				EnableTerminationMessageCompression:      true,
 				KeepStatusSpecDescriptions:               true,
 				EnableSurfacePodEvents:                   true,
+				EnableSpotRetries:                        true,
 			},
 			fileName: "feature-flags-all-flags-set",
 		},
@@ -199,6 +201,34 @@ func TestNewFeatureFlagsFromConfigMap(t *testing.T) {
 		t.Run(fileName, func(t *testing.T) {
 			verifyConfigFileWithExpectedFeatureFlagsConfig(t, fileName, expectedConfig)
 		})
+	}
+}
+
+// The upstream webhook decodes Provenance.FeatureFlags strictly, so our flag must not reach the status.
+func TestEnableSpotRetriesIsNotSerialized(t *testing.T) {
+	flagOn, err := json.Marshal(config.FeatureFlags{EnableSpotRetries: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	flagOff, err := json.Marshal(config.FeatureFlags{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if d := cmp.Diff(string(flagOff), string(flagOn)); d != "" {
+		t.Errorf("JSON with enable-spot-retries on %s", diff.PrintWantGot(d))
+	}
+}
+
+func TestFeatureFlagsForProvenance(t *testing.T) {
+	flags := &config.FeatureFlags{EnableSpotRetries: true, EnableAPIFields: config.BetaAPIFields}
+
+	got := flags.ForProvenance()
+
+	if d := cmp.Diff(&config.FeatureFlags{EnableAPIFields: config.BetaAPIFields}, got); d != "" {
+		t.Errorf("ForProvenance() %s", diff.PrintWantGot(d))
+	}
+	if !flags.EnableSpotRetries {
+		t.Error("ForProvenance() cleared EnableSpotRetries on the shared flags")
 	}
 }
 

@@ -368,6 +368,7 @@ func (c *Reconciler) ReconcileKind(ctx context.Context, tr *v1.TaskRun) (reconci
 	// Knative's generated reconciler only calls UpdateStatus(), never writes .metadata,
 	// so we must persist label/annotation changes ourselves.
 	defer func() {
+		setNodeLostRetriesLabel(ctx, tr)
 		if err := c.syncMetadata(ctx, tr); err != nil {
 			logger.Warn("Failed to sync TaskRun metadata", zap.Error(err))
 			events.EmitError(controller.GetEventRecorder(ctx), err, tr)
@@ -476,6 +477,10 @@ func (c *Reconciler) ReconcileKind(ctx context.Context, tr *v1.TaskRun) (reconci
 
 	// Store the condition before reconcile
 	before = tr.Status.GetCondition(apis.ConditionSucceeded)
+
+	if c.failHoldWithoutPod(ctx, tr) {
+		return c.emitReconcileEvents(ctx, tr, before, nil)
+	}
 
 	// Reconcile this copy of the task run and then write back any status
 	// updates regardless of whether the reconciliation errored out.
@@ -732,12 +737,22 @@ func (c *Reconciler) emitReconcileEvents(ctx context.Context, tr *v1.TaskRun, be
 	defer span.End()
 
 	afterCondition := tr.Status.GetCondition(apis.ConditionSucceeded)
-	if afterCondition.IsFalse() && !tr.IsCancelled() && tr.IsRetriable() {
+	// Free retries (enable-spot-retries) decide only an attempt that was running before this reconcile (IsUnknown is true for nil),
+	// never a done TaskRun: not a resync, not a succeeded one that stopSidecars marks failed.
+	spotRetriesDecide := config.FromContextOrDefaults(ctx).FeatureFlags.EnableSpotRetries && beforeCondition.IsUnknown()
+	hold := false
+	if afterCondition.IsFalse() && !tr.IsCancelled() && spotRetriesDecide {
+		hold = c.retryAfterFailure(ctx, tr)
+		afterCondition = tr.Status.GetCondition(apis.ConditionSucceeded)
+	} else if afterCondition.IsFalse() && !tr.IsCancelled() && tr.IsRetriable() {
 		retryTaskRun(tr, afterCondition.Message)
 		afterCondition = tr.Status.GetCondition(apis.ConditionSucceeded)
 	}
 	events.Emit(ctx, beforeCondition, afterCondition, tr)
 
+	if hold && previousError == nil {
+		return controller.NewRequeueAfter(failureCauseRequeue)
+	}
 	if controller.IsPermanentError(previousError) {
 		return controller.NewPermanentError(previousError)
 	}
@@ -1626,7 +1641,7 @@ func storeTaskSpecAndMergeMeta(ctx context.Context, tr *v1.TaskRun, ts *v1.TaskS
 			tr.Status.Provenance = &v1.Provenance{}
 		}
 		// Store FeatureFlags in the Provenance.
-		tr.Status.Provenance.FeatureFlags = cfg.FeatureFlags
+		tr.Status.Provenance.FeatureFlags = cfg.FeatureFlags.ForProvenance()
 		// Propagate RefSource from remote resolution to TaskRun Status
 		// This lives outside of the status.spec check to avoid the case where only the spec is available in the first reconcile and refSource comes in next reconcile.
 		if meta != nil && meta.RefSource != nil && tr.Status.Provenance.RefSource == nil {
