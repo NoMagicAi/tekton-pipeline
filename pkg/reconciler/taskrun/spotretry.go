@@ -60,6 +60,8 @@ const (
 	podReasonDeletionByPodGC        = "DeletionByPodGC"
 	podReasonDeletionByTaintManager = "DeletionByTaintManager"
 	nodeShutdownMessage             = "Pod was terminated in response to imminent node shutdown."
+	// GKE sets this reason when it deletes the pods of a removed node. It acts before PodGC.
+	podReasonDeletionByGCPControllerManager = "DeletionByGCPControllerManager"
 	// podRejectedPrefix starts the message of every pod the kubelet rejects at admission.
 	podRejectedPrefix = "Pod was rejected: "
 
@@ -99,6 +101,8 @@ func nodeLostCause(pod *corev1.Pod) (cause string, lost bool) {
 			return fmt.Sprintf("pod deleted by PodGC on %s", pod.Spec.NodeName), true
 		case condition.Reason == podReasonDeletionByTaintManager:
 			return fmt.Sprintf("pod evicted by taint manager on %s", pod.Spec.NodeName), true
+		case condition.Reason == podReasonDeletionByGCPControllerManager:
+			return fmt.Sprintf("pod deleted by GKE after node %s was removed", pod.Spec.NodeName), true
 		}
 	}
 	return "", false

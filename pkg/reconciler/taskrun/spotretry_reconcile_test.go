@@ -46,6 +46,8 @@ const (
 	nodeShutdownCause = "pod lost to node shutdown on node-a"
 )
 
+const gkeRemovedNodeCause = "pod deleted by GKE after node node-a was removed"
+
 var nodeShutdownCondition = corev1.PodCondition{
 	Type:    corev1.DisruptionTarget,
 	Status:  corev1.ConditionTrue,
@@ -111,6 +113,20 @@ func evictedSpotPod() *corev1.Pod {
 	})
 	pod.Status.Reason = "Evicted"
 	pod.Status.Message = "The node was low on resource: memory."
+	return pod
+}
+
+// gkeRemovedNodePod returns the attempt's pod as GKE leaves it when it removes the node:
+// phase Failed with the step still running, and no message.
+func gkeRemovedNodePod() *corev1.Pod {
+	pod := runningSpotPod()
+	pod.Status.Phase = corev1.PodFailed
+	pod.Status.Conditions = []corev1.PodCondition{{
+		Type:    corev1.DisruptionTarget,
+		Status:  corev1.ConditionTrue,
+		Reason:  "DeletionByGCPControllerManager",
+		Message: "GCPControllerManager: node no longer exists",
+	}}
 	return pod
 }
 
@@ -276,6 +292,19 @@ func TestReconcileSpotRetry(t *testing.T) {
 		},
 		wantLabel: "1",
 		wantEvent: "Normal NodeLostRetry Retrying after node loss (1 of 3): " + nodeShutdownCause,
+	}, {
+		name: "node removed by GKE, fixture, retries 1",
+		setup: func(tr *v1.TaskRun) {
+			tr.Annotations = fixtureAnnotations()
+			tr.Spec.Retries = 1
+		},
+		pod:  gkeRemovedNodePod(),
+		want: succeeded(corev1.ConditionUnknown, v1.TaskRunReasonToBeRetried.String(), "Retrying after node loss (1 of 3): "+gkeRemovedNodeCause),
+		wantRetries: []apis.Condition{
+			succeeded(corev1.ConditionFalse, reasonNodeLost, gkeRemovedNodeCause+" (was Failed: build failed for unspecified reasons.)"),
+		},
+		wantLabel: "1",
+		wantEvent: "Normal NodeLostRetry Retrying after node loss (1 of 3): " + gkeRemovedNodeCause,
 	}, {
 		name: "eviction is not a node-loss retry",
 		pod:  evictedSpotPod(),

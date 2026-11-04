@@ -69,6 +69,11 @@ func TestNodeLostCause(t *testing.T) {
 		wantCause: "pod evicted by taint manager on node-a",
 		wantLost:  true,
 	}, {
+		name:      "node removed, GKE",
+		pod:       podWithDisruption(corev1.ConditionTrue, "DeletionByGCPControllerManager", "GCPControllerManager: node no longer exists"),
+		wantCause: "pod deleted by GKE after node node-a was removed",
+		wantLost:  true,
+	}, {
 		name: "condition false",
 		pod:  podWithDisruption(corev1.ConditionFalse, corev1.PodReasonTerminationByKubelet, nodeShutdownMessage),
 	}, {
