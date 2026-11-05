@@ -821,3 +821,91 @@ func TestReconcileSpotRetryStatusWriteFails(t *testing.T) {
 		t.Errorf("retry events %s", diff.PrintWantGot(d))
 	}
 }
+
+// TestReconcileSpotRetryStaleCopyWithoutPod reproduces 2026-11-05 on ci-1: GKE set the pod Failed and deleted it
+// at once. The reconcile after the node-loss decision read a cached TaskRun from before that decision.
+func TestReconcileSpotRetryStaleCopyWithoutPod(t *testing.T) {
+	gkeRemovedNodeFailure := " (was Failed: build failed for unspecified reasons.)"
+	tests := []struct {
+		name         string
+		nodeLosses   int // earlier node-loss retries
+		retries      int
+		want         apis.Condition
+		wantRetries  []apis.Condition
+		wantLabel    string
+		wantNextPods []string // pods created once the cache has the decision
+		// stopSidecars on a done TaskRun whose pod is gone returns NotFound (upstream)
+		wantNextError bool
+	}{{
+		name:    "node-loss retry",
+		retries: 1,
+		want:    succeeded(corev1.ConditionUnknown, v1.TaskRunReasonToBeRetried.String(), "Retrying after node loss (1 of 3): "+gkeRemovedNodeCause),
+		wantRetries: []apis.Condition{
+			succeeded(corev1.ConditionFalse, reasonNodeLost, gkeRemovedNodeCause+gkeRemovedNodeFailure),
+		},
+		wantLabel:    "1",
+		wantNextPods: []string{spotRetryPodName + "-retry1"},
+	}, {
+		name:          "node-loss limit reached, retries 0",
+		nodeLosses:    3,
+		want:          succeeded(corev1.ConditionFalse, reasonNodeLost, gkeRemovedNodeCause+"; node loss retry limit 3 reached"+gkeRemovedNodeFailure),
+		wantRetries:   repeatCondition(earlierNodeLoss, 3),
+		wantLabel:     "3",
+		wantNextError: true,
+	}}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			tr := spotRetryTaskRun(t)
+			withNodeLostRetries(tr, tc.nodeLosses)
+			tr.Annotations = fixtureAnnotations()
+			tr.Spec.Retries = tc.retries
+			pod := gkeRemovedNodePod()
+			assets, cancel := getTaskRunController(t, spotRetryTestData(tr, pod, "true"))
+			defer cancel()
+			createServiceAccount(t, assets, "default", tr.Namespace)
+
+			reconcileSpotRetry(t, assets, tr, false)
+			if err := assets.Clients.Kube.CoreV1().Pods(tr.Namespace).Delete(assets.Ctx, pod.Name, metav1.DeleteOptions{}); err != nil {
+				t.Fatal(err)
+			}
+			if err := assets.Informers.Pod.Informer().GetIndexer().Delete(pod); err != nil {
+				t.Fatal(err)
+			}
+			// The TaskRun cache has not seen the decision: it still has the attempt that ran in the deleted pod.
+			if err := assets.Informers.TaskRun.Informer().GetIndexer().Update(tr); err != nil {
+				t.Fatal(err)
+			}
+
+			got, _ := reconcileSpotRetry(t, assets, tr, false)
+
+			if created := createdPods(assets); len(created) > 0 {
+				t.Errorf("created pods %v, want none from a stale TaskRun", created)
+			}
+			checkSpotRetryResult(t, got, tc.want, tc.wantRetries, tc.wantLabel)
+
+			if err := assets.Informers.TaskRun.Informer().GetIndexer().Update(got); err != nil {
+				t.Fatal(err)
+			}
+			reconcileSpotRetry(t, assets, tr, tc.wantNextError)
+			if d := cmp.Diff(tc.wantNextPods, createdPods(assets), cmpopts.EquateEmpty()); d != "" {
+				t.Errorf("created pods %s", diff.PrintWantGot(d))
+			}
+		})
+	}
+}
+
+// TestReconcileSpotRetryPodGoneCacheCurrent checks that a running TaskRun whose cached copy is current still gets its
+// deleted pod back under the same name, as upstream does.
+func TestReconcileSpotRetryPodGoneCacheCurrent(t *testing.T) {
+	tr := spotRetryTaskRun(t)
+	assets, cancel := getTaskRunController(t, spotRetryTestData(tr, nil, "true"))
+	defer cancel()
+	createServiceAccount(t, assets, "default", tr.Namespace)
+
+	reconcileSpotRetry(t, assets, tr, false)
+
+	if d := cmp.Diff([]string{spotRetryPodName}, createdPods(assets)); d != "" {
+		t.Errorf("created pods %s", diff.PrintWantGot(d))
+	}
+}
