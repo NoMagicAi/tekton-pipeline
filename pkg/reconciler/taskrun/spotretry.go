@@ -27,6 +27,7 @@ import (
 	v1 "github.com/tektoncd/pipeline/pkg/apis/pipeline/v1"
 	corev1 "k8s.io/api/core/v1"
 	k8serrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"knative.dev/pkg/apis"
 	"knative.dev/pkg/controller"
 )
@@ -300,6 +301,27 @@ func (c *Reconciler) failHoldWithoutPod(ctx context.Context, tr *v1.TaskRun) boo
 		return false
 	}
 	tr.Status.MarkResourceFailed(v1.TaskRunReasonFailed, fmt.Errorf("pod %s was deleted while waiting for %s", tr.Status.PodName, waitingFor))
+	return true
+}
+
+// staleWithoutPod reports whether the attempt's pod is gone and the API server has a newer TaskRun than this cached
+// copy, which upstream would act on. It takes the newer status, so the status write at the end changes nothing.
+func (c *Reconciler) staleWithoutPod(ctx context.Context, tr *v1.TaskRun) bool {
+	if !config.FromContextOrDefaults(ctx).FeatureFlags.EnableSpotRetries || tr.Status.PodName == "" {
+		return false
+	}
+	if _, err := c.podLister.Pods(tr.Namespace).Get(tr.Status.PodName); !k8serrors.IsNotFound(err) {
+		return false
+	}
+	live, err := c.PipelineClientSet.TektonV1().TaskRuns(tr.Namespace).Get(ctx, tr.Name, metav1.GetOptions{})
+	if err != nil {
+		// Without the live TaskRun, waiting is safer than creating the pod again.
+		return true
+	}
+	if live.Status.PodName == tr.Status.PodName && !live.IsDone() {
+		return false
+	}
+	tr.Status = live.Status
 	return true
 }
 

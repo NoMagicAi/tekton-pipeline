@@ -478,6 +478,9 @@ func (c *Reconciler) ReconcileKind(ctx context.Context, tr *v1.TaskRun) (reconci
 	// Store the condition before reconcile
 	before = tr.Status.GetCondition(apis.ConditionSucceeded)
 
+	if c.staleWithoutPod(ctx, tr) {
+		return controller.NewRequeueAfter(time.Second)
+	}
 	if c.failHoldWithoutPod(ctx, tr) {
 		return c.emitReconcileEvents(ctx, tr, before, nil)
 	}
